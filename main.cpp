@@ -1,4 +1,5 @@
-#include "kernel.h"
+#include "./pso/cuda_pso.h"
+#include "./de/cuda_de.h"
 
 int main(int argc, char** argv) {
 
@@ -28,7 +29,7 @@ int main(int argc, char** argv) {
             gBest[k] = pBests[k];
 
         clock_t begin = clock();
-        cuda_pso(positions, velocities, pBests, gBest);    
+        cuda_pso(positions, velocities, pBests, gBest);
         clock_t end = clock();
         printf("GPU \t ");
         printf("%10.3lf \t", (double)(end - begin)/CLOCKS_PER_SEC);
