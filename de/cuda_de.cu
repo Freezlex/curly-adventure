@@ -72,6 +72,50 @@ __device__ float fitness_function(float x[]) {
     return res;
 }
 
+__global__ void kernelMutateParticle(float *positions, float *velocities, 
+                                     float *pBests, float *gBest, int *randIndices) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // avoid an out of bound for the array 
+    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
+        return;
+
+    // Select 2 random from population
+    int particle_index = i / NUM_OF_PARTICLES;
+    int dimension_index = i % NUM_OF_DIMENSIONS;
+
+    int randIndex1 = randIndices[particle_index * 3];
+    int randIndex2 = randIndices[particle_index * 3 + 1];
+    int randIndex3 = randIndices[particle_index * 3 + 2];
+
+    float mutationFactor = 0.5; // You can adjust this value
+    float crossoverRate = 0.7;  // You can adjust this value
+
+    // Perform mutation on the current particle
+    float mutatedValue = positions[randIndex1 * NUM_OF_DIMENSIONS + dimension_index] +
+                         mutationFactor * (positions[randIndex2 * NUM_OF_DIMENSIONS + dimension_index] -
+                                           positions[randIndex3 * NUM_OF_DIMENSIONS + dimension_index]);
+
+    // Apply crossover with a random probability
+    if ((float)rand() / RAND_MAX < crossoverRate || dimension_index == rand() % NUM_OF_DIMENSIONS) {
+        positions[i] = mutatedValue; // Update the position with the mutated value
+        velocities[i] = mutatedValue - positions[i]; // Update velocity as well
+    }
+}
+
+__global__ void kernelCrossoverParticle(float *positions, float *velocities,
+                                        float *pBests, float *gBest) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // avoid an out of bound for the array 
+    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
+        return;
+
+    // Select 2 random from population
+    
+
+}
+
 /**
  * 
  * Runs on the GPU, called from the CPU or the GPU
@@ -129,7 +173,7 @@ __global__ void kernelUpdatePBest(float *positions, float *pBests, float* gBest)
 }
 
 
-extern "C" void cuda_de(float *positions, float *velocities, float *pBests, float *gBest)
+extern "C" void cuda_pso(float *positions, float *velocities, float *pBests, float *gBest)
 {
 
     int size = NUM_OF_PARTICLES * NUM_OF_DIMENSIONS;
@@ -167,7 +211,9 @@ extern "C" void cuda_de(float *positions, float *velocities, float *pBests, floa
     // MAX_ITER = 30000;
 
     for (int iter = 0; iter < MAX_ITER; iter++)
-    {     
+    {
+        kernelMutateParticle<<<blocksNum, threadsNum>>>(devPos, devVel, 
+                                                        devPBest, devGBest);
 
         kernelUpdateParticle<<<blocksNum, threadsNum>>>(devPos, devVel, 
                                                         devPBest, devGBest, 
@@ -212,3 +258,4 @@ extern "C" void cuda_de(float *positions, float *velocities, float *pBests, floa
     cudaFree(devPBest);
     cudaFree(devGBest);
 }
+

@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "shell",
+			"label": "Cuda DE",
+			"command": "nvcc -o .out/CUDA_DE_exec ./de/cuda_de.cpp ./de/cuda_de.cu ./de/main.cpp",
+			"problemMatcher": ["$nvcc"],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		}
+	]
+}
