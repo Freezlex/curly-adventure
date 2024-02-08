@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
 #include <cuda.h>
 #include <math_functions.h>
 
@@ -7,6 +8,7 @@
 
 __device__ float tempParticle1[NUM_OF_DIMENSIONS];
 __device__ float tempParticle2[NUM_OF_DIMENSIONS];
+__device__ curandState_t devStates[NUM_OF_PARTICLES];
 
 /* Objective function
 0: Levy 3-dimensional
@@ -72,6 +74,67 @@ __device__ float fitness_function(float x[]) {
     return res;
 }
 
+/**
+ * Runs on the GPU, called from the CPU.
+ * Initializes the random states for each thread.
+ */
+__global__ void initRandomStates(unsigned int seed) {
+
+    // Get thread id
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Init random seed
+    curand_init(seed, i, 0, &devStates[i]);
+}
+
+/**
+ * Runs on the GPU, called from the GPU.
+ * Generates a random float using the curand library.
+ */
+__device__ float getRandom() {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    return curand_uniform(&devStates[tid]);
+}
+
+/**
+ * Runs on the GPU, called from the CPU.
+ * Find bestest solution in the current population.
+*/
+__global__ void kernelFindBest(float *devObjVal, float *devPos, float *devGBest, float *devPBest) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < NUM_OF_PARTICLES) {
+        if (devObjVal[i] < *devGBest) {
+            *devGBest = devObjVal[i];
+            for (int j = 0; j < NUM_OF_DIMENSIONS; j++) {
+                devPBest[j] = devObjVal[i * NUM_OF_DIMENSIONS + j];
+            }
+        }
+    }
+}
+
+/**
+ * Init population through kernel to avoid memory transfert between host and device
+ */
+__global__ void kernelInitPopulation(float *devPos, float *objVal) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // avoid an out of bound for the array
+    for (int i = 0; i < NUM_OF_PARTICLES*NUM_OF_DIMENSIONS; i++) {
+
+        // avoid an out of bound for the array
+        if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
+            return;
+
+        devPos[i] = getRandom();
+        float x[NUM_OF_DIMENSIONS];
+        for(int j = 0; j < NUM_OF_DIMENSIONS; j++)
+            x[j] = devPos[i+j];
+        
+        objVal[i / NUM_OF_DIMENSIONS] = fitness_function(x);
+    }
+}
+
 __global__ void kernelMutateParticle(float *positions, float *velocities, 
                                      float *pBests, float *gBest, int *randIndices) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -84,9 +147,9 @@ __global__ void kernelMutateParticle(float *positions, float *velocities,
     int particle_index = i / NUM_OF_PARTICLES;
     int dimension_index = i % NUM_OF_DIMENSIONS;
 
-    int randIndex1 = randIndices[particle_index * 3];
-    int randIndex2 = randIndices[particle_index * 3 + 1];
-    int randIndex3 = randIndices[particle_index * 3 + 2];
+    int randIndex1 = randIndices[particle_index];
+    int randIndex2 = randIndices[particle_index + NUM_OF_PARTICLES];
+    int randIndex3 = randIndices[particle_index + 2 * NUM_OF_PARTICLES];
 
     float mutationFactor = 0.5; // You can adjust this value
     float crossoverRate = 0.7;  // You can adjust this value
@@ -150,37 +213,32 @@ __global__ void kernelUpdateParticle(float *positions, float *velocities,
 }
 
 /**
- * Runs on the GPU, called from the CPU or the GPU
+ * Runs on the GPU, called from the CPU.
+ * Find bestest solution in the current population.
 */
-__global__ void kernelUpdatePBest(float *positions, float *pBests, float* gBest)
-{
+__global__ void kernelFindBest(float *objectiveValues, float *positions, float *bestObjective, float *bestPosition) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS || i % NUM_OF_DIMENSIONS != 0)
-        return;
 
-    for (int j = 0; j < NUM_OF_DIMENSIONS; j++)
-    {
-        tempParticle1[j] = positions[i + j];
-        tempParticle2[j] = pBests[i + j];
-    }
-
-    if (fitness_function(tempParticle1) < fitness_function(tempParticle2))
-    {
-        for (int k = 0; k < NUM_OF_DIMENSIONS; k++)
-            pBests[i + k] = positions[i + k];
+    if (i < NUM_OF_PARTICLES) {
+        if (objectiveValues[i] < *bestObjective) {
+            *bestObjective = objectiveValues[i];
+            for (int j = 0; j < NUM_OF_DIMENSIONS; j++) {
+                bestPosition[j] = positions[i * NUM_OF_DIMENSIONS + j];
+            }
+        }
     }
 }
 
 
-extern "C" void cuda_pso(float *positions, float *velocities, float *pBests, float *gBest)
+extern "C" void cuda_de(float *positions, float *velocities, float *pBests, float *gBest)
 {
 
     int size = NUM_OF_PARTICLES * NUM_OF_DIMENSIONS;
     
     // declare all the arrays on the device
     float *devPos;
-    float *devVel;
+    // Old devVel
+    float *objVal;
     float *devPBest;
     float *devGBest;
     
@@ -188,7 +246,7 @@ extern "C" void cuda_pso(float *positions, float *velocities, float *pBests, flo
         
     // Memory allocation
     cudaMalloc((void**)&devPos, sizeof(float) * size);
-    cudaMalloc((void**)&devVel, sizeof(float) * size);
+    cudaMalloc((void**)&objVal, sizeof(float) * size);
     cudaMalloc((void**)&devPBest, sizeof(float) * size);
     cudaMalloc((void**)&devGBest, sizeof(float) * NUM_OF_DIMENSIONS);
     
@@ -197,11 +255,11 @@ extern "C" void cuda_pso(float *positions, float *velocities, float *pBests, flo
     int blocksNum = ceil(size / threadsNum);
     
     // Copy particle datas from host to device
-    /**
+    /**Auucn
      * Copy in GPU memory the data from the host 
      * */
     cudaMemcpy(devPos, positions, sizeof(float) * size, cudaMemcpyHostToDevice);
-    cudaMemcpy(devVel, velocities, sizeof(float) * size, 
+    cudaMemcpy(objVal, velocities, sizeof(float) * size, 
                cudaMemcpyHostToDevice);
     cudaMemcpy(devPBest, pBests, sizeof(float) * size, cudaMemcpyHostToDevice);
     cudaMemcpy(devGBest, gBest, sizeof(float) * NUM_OF_DIMENSIONS, 
@@ -210,42 +268,35 @@ extern "C" void cuda_pso(float *positions, float *velocities, float *pBests, flo
     // PSO main function
     // MAX_ITER = 30000;
 
+    kernelInitPopulation<<<blocksNum, threadIdx>>>(devPos, objVal);
+
+    kernelFindBest<<<blocksNum, threadIdx>>>(objVal, devPos, devGBest, devPBest);
+
     for (int iter = 0; iter < MAX_ITER; iter++)
     {
-        kernelMutateParticle<<<blocksNum, threadsNum>>>(devPos, devVel, 
-                                                        devPBest, devGBest);
+        kernelMutateParticle<<<blocksNum, threadsNum>>>(devPos, devVel);
+        
+        // Mutation preparation
+        kernelMutationPrep<<<blocksNum, threadsNum>>>(devIndices);
 
-        kernelUpdateParticle<<<blocksNum, threadsNum>>>(devPos, devVel, 
-                                                        devPBest, devGBest, 
-                                                        getRandomClamped(), 
-                                                        getRandomClamped());  
+        // Mutation
+        kernelMutation<<<blocksNum, threadsNum>>>(devPos, devMutant, devIndices);
 
-        kernelUpdatePBest<<<blocksNum, threadsNum>>>(devPos, devPBest, 
-                                                     devGBest);
-        
-        cudaMemcpy(pBests, devPBest, 
-                   sizeof(float) * NUM_OF_PARTICLES * NUM_OF_DIMENSIONS, 
-                   cudaMemcpyDeviceToHost);
-        
-        
-        for(int i = 0; i < size; i += NUM_OF_DIMENSIONS)
-        {
-            for(int k = 0; k < NUM_OF_DIMENSIONS; k++) //ssB1 
-                temp[k] = pBests[i + k];
-        
-            if (host_fitness_function(temp) < host_fitness_function(gBest))
-            {
-                for (int k = 0; k < NUM_OF_DIMENSIONS; k++)
-                    gBest[k] = temp[k];
-            }   
-        }
-        
-        cudaMemcpy(devGBest, gBest, sizeof(float) * NUM_OF_DIMENSIONS, 
-                   cudaMemcpyHostToDevice);
+        // Crossover
+        kernelCrossover<<<blocksNum, threadsNum>>>(devPos, devMutant, devTrial, devIndices);
+
+        // Evaluation of trial vectors
+        kernelEval<<<blocksNum, threadsNum>>>(devTrial, devObjectiveValues);
+
+        // Replacement
+        kernelReplacement<<<blocksNum, threadsNum>>>(devPos, devTrial, devObjectiveValues);
+
+        // Check if the current result is better than the best result
+        kernelFindBest<<<blocksNum, threadsNum>>>(devObjectiveValues, devTrial, devBestObjective, devBestPosition);
     }
     
     cudaMemcpy(positions, devPos, sizeof(float) * size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(velocities, devVel, sizeof(float) * size, 
+    cudaMemcpy(velocities, objVal, sizeof(float) * size, 
                cudaMemcpyDeviceToHost);
     cudaMemcpy(pBests, devPBest, sizeof(float) * size, cudaMemcpyDeviceToHost);
     cudaMemcpy(gBest, devGBest, sizeof(float) * NUM_OF_DIMENSIONS, 
