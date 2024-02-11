@@ -5,10 +5,17 @@
 
 #include "cuda_de.h"
 
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
-__device__ float tempParticle1[NUM_OF_DIMENSIONS];
-__device__ float tempParticle2[NUM_OF_DIMENSIONS];
-__device__ curandState_t devStates[NUM_OF_PARTICLES];
+__global__ curandState_t devStates[NUM_OF_PARTICLES];
 
 /* Objective function
 0: Levy 3-dimensional
@@ -78,7 +85,7 @@ __device__ float fitness_function(float x[]) {
  * Runs on the GPU, called from the CPU.
  * Initializes the random states for each thread.
  */
-__global__ void initRandomStates(unsigned int seed) {
+__global__ void KInitRandomStates(unsigned int seed) {
 
     // Get thread id
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -100,116 +107,84 @@ __device__ float getRandom() {
  * Runs on the GPU, called from the CPU.
  * Find bestest solution in the current population.
 */
-__global__ void kernelFindBest(float *devObjVal, float *devPos, float *devGBest, float *devPBest) {
+__global__ void KFindBest(Particle* pop, Particle &gBest) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (i < NUM_OF_PARTICLES) {
-        if (devObjVal[i] < *devGBest) {
-            *devGBest = devObjVal[i];
-            for (int j = 0; j < NUM_OF_DIMENSIONS; j++) {
-                devPBest[j] = devObjVal[i * NUM_OF_DIMENSIONS + j];
-            }
-        }
-    }
+    // avoid an out of bound for the array 
+    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
+        return;
+
+    if(pop[i].fitness < gBest.fitness)
+        gBest = pop[i];
 }
 
 /**
  * Init population through kernel to avoid memory transfert between host and device
  */
-__global__ void kernelInitPopulation(float *devPos, float *objVal) {
+__global__ void KInitPopulation(Particle* pop) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // avoid an out of bound for the array
-    for (int i = 0; i < NUM_OF_PARTICLES*NUM_OF_DIMENSIONS; i++) {
+    // avoid an out of bound for the array 
+    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
+        return;
+    
+    Particle particle;
+    for(int j=0;i<NUM_OF_DIMENSIONS;j++)
+        particle.position[j] = getRandom();
 
-        // avoid an out of bound for the array
-        if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
-            return;
+    particle.fitness = host_fitness_function(particle.position);
+    pop[i] = particle;
+}
 
-        devPos[i] = getRandom();
-        float x[NUM_OF_DIMENSIONS];
-        for(int j = 0; j < NUM_OF_DIMENSIONS; j++)
-            x[j] = devPos[i+j];
-        
-        objVal[i / NUM_OF_DIMENSIONS] = fitness_function(x);
+__global__ void KMutateParticle(Particle* pop, Particle* mutants) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Ensure tid is within bounds
+    if(tid >= NUM_OF_PARTICLES)
+        return;
+
+    // Select random indices for mutation
+    int r1 = tid;
+    int r2 = (tid + 1) % NUM_OF_PARTICLES;
+    int r3 = (tid + 2) % NUM_OF_PARTICLES;
+
+    // Generate a mutant solution
+    for(int i = 0; i < NUM_OF_DIMENSIONS; ++i) {
+        mutants[tid].position[i] = pop[r1].position[i] + mF * (pop[r2].position[i] - pop[r3].position[i]);
     }
 }
 
-__global__ void kernelMutateParticle(float *positions, float *velocities, 
-                                     float *pBests, float *gBest, int *randIndices) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void KCrossoverParticle(Particle* pop, Particle* mutants, Particle* offspring) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // avoid an out of bound for the array 
-    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
+    // Ensure tid is within bounds
+    if(tid >= NUM_OF_PARTICLES)
         return;
 
-    // Select 2 random from population
-    int particle_index = i / NUM_OF_PARTICLES;
-    int dimension_index = i % NUM_OF_DIMENSIONS;
-
-    int randIndex1 = randIndices[particle_index];
-    int randIndex2 = randIndices[particle_index + NUM_OF_PARTICLES];
-    int randIndex3 = randIndices[particle_index + 2 * NUM_OF_PARTICLES];
-
-    float mutationFactor = 0.5; // You can adjust this value
-    float crossoverRate = 0.7;  // You can adjust this value
-
-    // Perform mutation on the current particle
-    float mutatedValue = positions[randIndex1 * NUM_OF_DIMENSIONS + dimension_index] +
-                         mutationFactor * (positions[randIndex2 * NUM_OF_DIMENSIONS + dimension_index] -
-                                           positions[randIndex3 * NUM_OF_DIMENSIONS + dimension_index]);
-
-    // Apply crossover with a random probability
-    if ((float)rand() / RAND_MAX < crossoverRate || dimension_index == rand() % NUM_OF_DIMENSIONS) {
-        positions[i] = mutatedValue; // Update the position with the mutated value
-        velocities[i] = mutatedValue - positions[i]; // Update velocity as well
+    // Perform crossover operation
+    for(int i = 0; i < NUM_OF_DIMENSIONS; ++i) {
+        if(getRandom() < cF || i == rand() % NUM_OF_DIMENSIONS) {
+            offspring[tid].position[i] = mutants[tid].position[i];
+        } else {
+            offspring[tid].position[i] = pop[tid].position[i];
+        }
     }
 }
 
-__global__ void kernelCrossoverParticle(float *positions, float *velocities,
-                                        float *pBests, float *gBest) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void KEvalAndReplacePop(Particle* pop, Particle* offspring) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // avoid an out of bound for the array 
-    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
+    // Ensure tid is within bounds
+    if(tid >= NUM_OF_PARTICLES)
         return;
 
-    // Select 2 random from population
-    
+    // Evaluate fitness of offspring
+    offspring[tid].fitness = host_fitness_function(offspring[tid].position);
 
-}
-
-/**
- * 
- * Runs on the GPU, called from the CPU or the GPU
-*/
-__global__ void kernelUpdateParticle(float *positions, float *velocities, 
-                                     float *pBests, float *gBest, float r1, 
-                                     float r2)
-{
-
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // avoid an out of bound for the array 
-    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
-        return;
-
-    //float rp = getRandomClamped();
-    //float rg = getRandomClamped();
-    
-    float rp = r1; // random weight for personnal =>  computed from @getRandomClamped
-    float rg = r2; // random weight for global =>  computed from @getRandomClamped
-
-
-    // Mise à jour de velocities et positions
-    velocities[i] = OMEGA * velocities[i] + 
-                    c1 * rp * (pBests[i] - positions[i]) + 
-                    c2 * rg * (gBest[i % NUM_OF_DIMENSIONS] - positions[i]);
-
-    // Update posisi particle
-    //Mise à jour de la position de la particule courante
-    //incrémentant la position de la particule courante avec la vitesse de la particule courante
-    positions[i] += velocities[i];
+    // Replace population member if offspring is better
+    if(offspring[tid].fitness < pop[tid].fitness) {
+        pop[tid] = offspring[tid];
+    }
 }
 
 /**
@@ -230,83 +205,64 @@ __global__ void kernelFindBest(float *objectiveValues, float *positions, float *
 }
 
 
-extern "C" void cuda_de(float *positions, float *velocities, float *pBests, float *gBest)
+extern "C" void cuda_de(Particle* gBest)
 {
-
+    // TODO : Clean above
     int size = NUM_OF_PARTICLES * NUM_OF_DIMENSIONS;
-    
-    // declare all the arrays on the device
-    float *devPos;
-    // Old devVel
-    float *objVal;
-    float *devPBest;
-    float *devGBest;
-    
-    float temp[NUM_OF_DIMENSIONS];
-        
-    // Memory allocation
-    cudaMalloc((void**)&devPos, sizeof(float) * size);
-    cudaMalloc((void**)&objVal, sizeof(float) * size);
-    cudaMalloc((void**)&devPBest, sizeof(float) * size);
-    cudaMalloc((void**)&devGBest, sizeof(float) * NUM_OF_DIMENSIONS);
-    
-    // Thread & Block number
-    int threadsNum = 32;
-    int blocksNum = ceil(size / threadsNum);
-    
-    // Copy particle datas from host to device
-    /**Auucn
-     * Copy in GPU memory the data from the host 
-     * */
-    cudaMemcpy(devPos, positions, sizeof(float) * size, cudaMemcpyHostToDevice);
-    cudaMemcpy(objVal, velocities, sizeof(float) * size, 
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(devPBest, pBests, sizeof(float) * size, cudaMemcpyHostToDevice);
-    cudaMemcpy(devGBest, gBest, sizeof(float) * NUM_OF_DIMENSIONS, 
-               cudaMemcpyHostToDevice);
-    
-    // PSO main function
-    // MAX_ITER = 30000;
+    int threadAmnt = 32;
+    int blocksAmnt = ceil(size / threadAmnt);
 
-    kernelInitPopulation<<<blocksNum, threadIdx>>>(devPos, objVal);
+    // Particles that build ou population
+    Particle* devPop;
+    Particle* devGBest;
+    Particle* devOffspring;
+    // Random states for each thread
+    Particle* devRandPop;
 
-    kernelFindBest<<<blocksNum, threadIdx>>>(objVal, devPos, devGBest, devPBest);
+    // GPU Memory allocation
+    gpuErrchk(cudaMalloc(&devPop, NUM_OF_PARTICLES * sizeof(Particle)));
+    gpuErrchk(cudaMalloc(&devRandPop, NUM_OF_PARTICLES * sizeof(Particle)));
+    gpuErrchk(cudaMalloc(&devGBest, sizeof(Particle)));
+    gpuErrchk(cudaMalloc(&devOffspring, NUM_OF_PARTICLES * sizeof(Particle)));
 
-    for (int iter = 0; iter < MAX_ITER; iter++)
+    KInitRandomStates<<<blocksAmnt, threadAmnt>>>(time(NULL));
+    cudaDeviceSynchronize();
+
+    KInitPopulation<<<blocksAmnt, threadAmnt>>>(devPop);
+    KInitPopulation<<<blocksAmnt, threadAmnt>>>(devRandPop);
+    cudaDeviceSynchronize();
+
+    KFindBest<<<blocksAmnt, threadAmnt>>>(devPop, *devGBest);
+
+    int iter;
+    for (iter = 0; iter < MAX_ITER; iter++)
     {
-        kernelMutateParticle<<<blocksNum, threadsNum>>>(devPos, devVel);
-        
-        // Mutation preparation
-        kernelMutationPrep<<<blocksNum, threadsNum>>>(devIndices);
-
-        // Mutation
-        kernelMutation<<<blocksNum, threadsNum>>>(devPos, devMutant, devIndices);
+        KMutateParticle<<<blocksAmnt, threadAmnt>>>(devPop, devRandPop);
 
         // Crossover
-        kernelCrossover<<<blocksNum, threadsNum>>>(devPos, devMutant, devTrial, devIndices);
-
-        // Evaluation of trial vectors
-        kernelEval<<<blocksNum, threadsNum>>>(devTrial, devObjectiveValues);
+        KCrossoverParticle<<<blocksAmnt, threadAmnt>>>(devPop, devRandPop, devOffspring);
 
         // Replacement
-        kernelReplacement<<<blocksNum, threadsNum>>>(devPos, devTrial, devObjectiveValues);
+        KEvalAndReplacePop<<<blocksAmnt, threadAmnt>>>(devPop, devOffspring);
 
         // Check if the current result is better than the best result
-        kernelFindBest<<<blocksNum, threadsNum>>>(devObjectiveValues, devTrial, devBestObjective, devBestPosition);
+        KFindBest<<<blocksAmnt, threadAmnt>>>(devPop, *devGBest);
     }
+
+    printf("Start waiting for GPU to finish...\n");
     
-    cudaMemcpy(positions, devPos, sizeof(float) * size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(velocities, objVal, sizeof(float) * size, 
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(pBests, devPBest, sizeof(float) * size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(gBest, devGBest, sizeof(float) * NUM_OF_DIMENSIONS, 
-               cudaMemcpyDeviceToHost); 
-    
+    cudaDeviceSynchronize();
+
+    // Copy values back to host
+    gpuErrchk(cudaMemcpy(devGBest, gBest, sizeof(Particle), cudaMemcpyDeviceToHost));
+
+
+    printf("Best fitness : %zu", gBest->fitness);
+    std::cout << gBest->fitness << std::endl;
     
     // cleanup
-    cudaFree(devPos);
-    cudaFree(devVel);
-    cudaFree(devPBest);
     cudaFree(devGBest);
+    cudaFree(devPop);
+    cudaFree(devRandPop);
+    cudaFree(devOffspring);
 }
-
